@@ -1,15 +1,21 @@
-# Notification design
+# Organization webhook receiver
 
-The caller creates a Discord incoming webhook and stores `DISCORD_WEBHOOK_URL` in the monitored repository. GitHub Actions runs `node scripts/notify.mjs` for issue and PR activity. The CLI reads `GITHUB_EVENT_PATH`, formats the event with `buildMessage(eventName, payload)`, then calls `sendMessage(webhookUrl, message)`.
+One Hyperlattice organization webhook sends `issues` and `pull_request` events to the Raspberry Pi's `/github/webhook` endpoint. GitHub organization webhooks cover every repository owned by the organization, so the design needs no per-repository workflow or API polling.
 
-The pure formatter owns supported actions and Discord size limits. The sender owns URL validation, HTTP delivery confirmation, timeouts, and bounded retries. The CLI owns environment and file input. There is no database or shared state.
+## Shape
+
+`createReceiver({ secret, organization, store })` owns the HTTP boundary. It limits body size, verifies the raw-body SHA-256 HMAC with constant-time comparison, checks the repository owner, and invokes the existing `buildMessage(eventName, payload)` formatter. That formatter owns supported actions, assignee and reviewer display, and Discord message limits.
+
+`DeliveryStore` owns the SQLite queue and delivery-ID deduplication. `enqueue(id, message)` commits before the HTTP 202 response. A single worker calls `deliverOne(send)` sequentially, keeping network work out of the request handler. Failed attempts are retried with persisted backoff. Pending rows require no in-flight recovery after a process crash because they remain pending until Discord confirms success.
+
+`sendMessage(webhookUrl, message)` owns Discord URL validation, receipt confirmation, timeouts, and bounded HTTP retries. `server.mjs` owns configuration, process lifecycle, and the worker loop. Docker Compose owns restart policy and the persistent volume. Tailscale Funnel or an existing HTTPS reverse proxy exposes the receiver to GitHub.
 
 ## Synthesis decision
 
-Two independent design candidates compared a hosted webhook receiver with GitHub Actions. Both recommended Actions for this scope. Against coverage, secret safety, setup burden, testability, and maintainability, Actions meets the required events with fewer operational requirements. The receiver offers centralized installation and durable queueing but requires hosting, signature validation, and persistent storage. No independent cross-judge ran because no alternate session configuration was available.
+The original design compared per-repository Actions with a hosted receiver. Requiring every Hyperlattice repository makes the receiver the better fit. The user chose instant organization-webhook delivery and a Raspberry Pi host. Adopt the receiver candidate's durable queue and signature validation while retaining the tested formatter and sender. Remove the per-repository notification workflow to give alert delivery one owner.
 
-Use the Actions candidate as the base. Adopt the receiver candidate's explicit delivery confirmation and bounded retry policy. Reject server deployment and a Discord gateway process because this task only needs outbound channel messages.
+Accept maintaining a home server and public HTTPS endpoint in exchange for immediate events and automatic coverage of new repositories. Accept possible duplicates after an ambiguous Discord send. Deduplication lasts 30 days after successful sending. Clear sent message bodies, retain failed work for operator recovery, and keep all storage in the mounted volume.
 
-Accept per-repository installation, Actions queue latency, and possible duplicates in exchange for no hosting. Preserve descriptions as bounded excerpts with the GitHub URL. Keep GitHub identities as text because Discord mentions require a separate identity map and explicit opt-in.
+## Verification
 
-Verification uses the actual formatter and sender, with HTTP responses injected in tests, plus a CLI fixture preview and GitHub CI. Live Discord delivery requires the user's channel webhook secret and a manual setup run.
+Behavior tests send real signed HTTP requests to the receiver, reopen the same SQLite database, and deliver the queued message through the sender to a local HTTP Discord stand-in. They verify multiple repository names, rejected signatures, foreign organizations, body limits, duplicate suppression, queue retries, and terminal-failure recovery. CI builds and smoke-tests the Docker image on Linux. Deployment on the physical Pi and live GitHub-to-Discord verification require the user's Pi and secrets.

@@ -4,7 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 
 const actions = {
   issues: new Set(['opened', 'edited', 'reopened', 'closed', 'assigned', 'unassigned']),
-  pull_request_target: new Set(['opened', 'edited', 'reopened', 'closed', 'assigned',
+  pull_request: new Set(['opened', 'edited', 'reopened', 'closed', 'assigned',
     'unassigned', 'review_requested', 'review_request_removed', 'ready_for_review', 'converted_to_draft']),
 };
 
@@ -23,7 +23,7 @@ export function buildMessage(eventName, payload) {
     return { allowed_mentions: { parse: [] }, content: 'GitHub → Discord alerts are connected.' };
   }
   if (!actions[eventName]?.has(payload.action)) return null;
-  const isPr = eventName === 'pull_request_target';
+  const isPr = eventName === 'pull_request';
   const item = isPr ? payload.pull_request : payload.issue;
   if (!isPr && item?.pull_request) return null;
   if (!item || typeof item.title !== 'string' || typeof item.html_url !== 'string'

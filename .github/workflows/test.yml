@@ -16,3 +16,18 @@ jobs:
         with:
           node-version: '24'
       - run: npm test
+      - name: Build and smoke-test Docker service
+        run: |
+          docker build -t discordbot-test .
+          docker run -d --name discordbot-test -p 127.0.0.1:3000:3000 \
+            -e GITHUB_WEBHOOK_SECRET=ci-only-test-secret-with-at-least-32-characters \
+            -e DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/123/ci-test \
+            discordbot-test
+          trap 'docker logs discordbot-test; docker rm -f discordbot-test' EXIT
+          for attempt in $(seq 1 20); do
+            if curl --fail http://127.0.0.1:3000/healthz; then
+              exit 0
+            fi
+            sleep 1
+          done
+          exit 1

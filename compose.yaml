@@ -1,0 +1,22 @@
+services:
+  discordbot:
+    build: .
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 3m
+    env_file: .env
+    environment:
+      DATA_DIR: /app/data
+      PORT: '3000'
+    ports:
+      - '127.0.0.1:3000:3000'
+    volumes:
+      - deliveries:/app/data
+    logging:
+      driver: json-file
+      options:
+        max-size: '10m'
+        max-file: '3'
+
+volumes:
+  deliveries:
