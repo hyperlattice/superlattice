@@ -1,58 +1,110 @@
-# Hyperlattice GitHub alerts for Discord
+# Superlattice
 
-One organization webhook sends issue and PR activity from **all current and future Hyperlattice repositories** to one Discord channel. Run this receiver on your Raspberry Pi. Nothing needs to be copied into the monitored repositories.
+Superlattice is a Discord bot and GitHub organization webhook receiver, designed to run continuously on a Raspberry Pi 5. It posts issue and PR notifications from all current and future **Hyperlattice** repositories and responds to `/ping`, `/status`, `/github`, and `/help` with embeds.
 
-Alerts include the title, link, description, author, assignees, and requested PR reviewers, including teams. Assignment and reviewer changes send new messages. GitHub usernames appear as text without Discord pings. Long descriptions show an excerpt with a link to GitHub.
+Follow the [Raspberry Pi deployment guide](docs/raspberry-pi.md) for Discord application creation, invitations, Docker installation, Tailscale Funnel, GitHub webhooks, and troubleshooting.
 
-Follow [the Raspberry Pi setup guide](docs/raspberry-pi.md) to deploy it.
+## Quick start
 
-You need:
+Use Node.js 24 and a Discord application invited to your server with the `bot` and `applications.commands` scopes. Give it **View Channel**, **Send Messages**, and **Embed Links** in the notification channel. No privileged Gateway intents are needed. Create an application and copy its bot token in the [Discord Developer Portal](https://discord.com/developers/applications); see [Discord's application setup guide](https://docs.discord.com/developers/quick-start/getting-started).
 
-- A Raspberry Pi running a 64-bit OS, Docker Engine, and Docker Compose.
-- A public HTTPS URL that forwards to the Pi, using Tailscale Funnel or your own HTTPS reverse proxy.
-- One Discord incoming webhook URL for your destination text channel.
-- One random webhook secret, shared between the Pi and GitHub.
-- Organization-owner access to create the Hyperlattice organization webhook.
+```sh
+npm ci
+cp .env.example .env
+chmod 600 .env
+openssl rand -hex 32
+# Edit .env: fill in the bot token, application ID, channel ID,
+# optional server ID, and the generated GitHub webhook secret.
+npm run deploy-commands
+npm start
+```
 
-No Discord bot token, GitHub personal access token, or per-repository Actions secret is needed by the service.
+For the Pi, after configuring `.env`:
 
-## Events
+```sh
+docker compose build
+docker compose run --rm --no-deps discordbot npm run deploy-commands
+docker compose up -d --build
+docker compose logs -f
+docker compose ps
+curl --fail http://127.0.0.1:3000/healthz
+```
+
+## Configuration
+
+| Variable | Required | Meaning |
+| --- | --- | --- |
+| `DISCORD_BOT_TOKEN` | Yes | Bot token from Developer Portal → Bot |
+| `DISCORD_CLIENT_ID` | Yes | Application ID from General Information |
+| `DISCORD_GUILD_ID` | No | Server ID; selects guild registration and restricts commands/notification channel to that server. Blank selects global server-only commands |
+| `DISCORD_CHANNEL_ID` | Yes | Notification destination, normally a server text channel |
+| `GITHUB_ORGANIZATION` | No | Organization login, default `hyperlattice` |
+| `GITHUB_WEBHOOK_SECRET` | Yes | Shared GitHub HMAC secret, at least 32 characters |
+| `PORT` | No | HTTP listener port, default `3000` |
+| `DATA_DIR` | No | SQLite directory, default `./data` |
+
+Compose sets `PORT=3000` and `DATA_DIR=/app/data`, mounts the existing named `deliveries` volume, and publishes only `127.0.0.1:3000`. Keep `.env` private and excluded from Git. The application validates configuration before opening its database. Registration only needs the token, application ID, and optional guild ID. No GitHub API token is required.
+
+## Slash commands
+
+| Command | Response |
+| --- | --- |
+| `/ping` | Pong, acknowledgement round-trip latency, WebSocket latency |
+| `/status` | Connection status, process uptime, RSS memory, Discord latency, receiver status, monitored organization |
+| `/github` | Linked organization and monitored events |
+| `/help` | Available commands and descriptions |
+
+Commands use the Gateway with only the `Guilds` intent. Leave the application's **Interactions Endpoint URL** empty so Discord sends interactions through the Gateway. Everyone allowed to use application commands in the server can use these read-only commands; server administrators can restrict them in Discord's integration settings.
+
+`npm run deploy-commands` bulk overwrites this application's command definitions in the configured scope. It updates commands by name, removes stale definitions, and does not create duplicate definitions in that scope. It runs separately from bot startup; rerun it after adding or changing commands. Guild commands are suited to development; global commands can take time to propagate. Global and guild commands are separate scopes in the [Discord application commands API](https://docs.discord.com/developers/interactions/application-commands).
+
+When switching scopes, first clear the old scope using its current `.env` values:
+
+```sh
+npm run deploy-commands -- --clear
+# Change DISCORD_GUILD_ID in .env (blank for global, server ID for guild).
+npm run deploy-commands
+```
+
+This application owns all commands in the selected application/scope; bulk registration replaces them. Add command modules under `bot/commands/` and include them in `bot/commands/index.mjs`; registration and `/help` use that shared registry.
+
+## GitHub events and delivery
 
 | Item | Alerts |
 | --- | --- |
 | Issues | Opened, edited, reopened, closed, assigned, unassigned |
 | Pull requests | Opened, edited, reopened, closed or merged, assigned, unassigned, review requested, review request removed, ready for review, converted to draft |
 
-In GitHub's organization webhook settings, select **Issues** and **Pull requests**. The receiver filters these event families to the actions above. Completed reviews and comments do not send alerts.
+Alerts preserve descriptions, authors, assignees, and PR reviewers including teams. Long descriptions include a link to the full text. GitHub mentions never ping Discord users or roles. Comments, completed reviews, pushes, and PR synchronization events are skipped.
 
-## Delivery behavior
+The receiver validates SHA-256 HMAC against the raw request body, checks the repository owner, and commits alerts to SQLite before responding HTTP 202. One worker sends messages using `client.channels.fetch()` and `channel.send()`, validates channel permissions, and marks a delivery sent only after Discord returns a message receipt. The stored API-format messages from the previous receiver remain compatible; no schema or data migration is needed.
 
-The receiver verifies GitHub's SHA-256 signature against the raw body and rejects repositories outside `GITHUB_ORGANIZATION`. It writes accepted alerts to a SQLite queue before returning HTTP 202. One worker sends the messages and retries delivery failures. Pending alerts survive container and Pi restarts when the data volume is preserved.
-
-GitHub delivery IDs prevent repeated alerts from duplicate deliveries for 30 days after sending. A crash after Discord accepts a message but before the queue records success can still cause a duplicate. This service does not promise exactly-once delivery.
-
-The worker makes up to eight queue attempts. Each attempt uses the sender's bounded HTTP retries. After exhaustion it logs `manual retry required`. Fix the cause, then requeue failed alerts using the command in the setup guide. Sent message bodies are cleared from SQLite. Pending and failed alerts retain their contents on disk.
-
-The Pi must be online to receive events. GitHub does not automatically redeliver failed webhook requests. After an outage, use the organization webhook's **Recent Deliveries** page to redeliver failures. This service receives new events and does not import historical issues or PRs.
-
-## Development
-
-Install Node.js 24 or later. There are no npm dependencies to install.
+Failures retry up to eight queue attempts with persisted exponential backoff (30 seconds up to one hour). discord.js manages request buckets and bounded network/server retries; rate-limit rejections return to the durable queue with a delay at least as long as Discord's cooldown. Gateway reconnects pause delivery attempts. Failed rows remain available for manual requeue:
 
 ```sh
-npm test
+docker compose exec discordbot node server.mjs --retry-failed
 ```
 
-Preview a PR alert without posting to Discord:
+Pending alerts survive restarts. Sent bodies are cleared; delivery IDs deduplicate for 30 days after sending. A crash after Discord accepts a message and before SQLite records success can produce a duplicate. Run one application instance per volume. Keep the volume during updates.
+
+The Pi must be reachable to receive events. [GitHub does not automatically redeliver failed webhook requests](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries); use Recent Deliveries after an outage. This bot does not import historical issues or PRs.
+
+## Testing
 
 ```sh
+npm ci
+npm test
 GITHUB_EVENT_NAME=pull_request GITHUB_EVENT_PATH=test/fixtures/pr.json npm run preview
 ```
 
-Tests cover a signed HTTP request through persistent storage to an HTTP Discord stand-in, cross-repository coverage, signature rejection, duplicate delivery, queue recovery, message limits, and the CLI preview. CI also builds and starts the Docker image.
+Tests use mocked Discord and real local HTTP/SQLite boundaries, without tokens or network access. They cover signature checks, organization filtering, formatting, duplicate suppression, queue persistence, retry exhaustion, rate limits, command responses and registration, invalid configuration, startup cleanup, and graceful shutdown under SIGINT/SIGTERM. CI also builds the Docker image and runs the mocked suite inside it.
 
-## Migrating from the original Actions version
+For a live check, invoke all four slash commands in your server, create a GitHub issue with a description/assignee, and request a PR review. Confirm the messages and check Recent Deliveries for HTTP 202. Redelivering the same GitHub delivery should return `Already received` without a second alert. A signed GitHub webhook `ping` returns `pong`; that handshake does not post a Discord message.
 
-The per-repository `Discord alerts` workflow has been removed from this repo. The new receiver replaces it. If you copied the old workflow into other repositories, remove it to avoid duplicate alerts. The old `DISCORD_WEBHOOK_URL` GitHub Actions secret can be removed after you configure the Pi. Store that URL in the Pi's `.env` instead.
+The preview command only prints JSON. To send the fixture through the bot manually, use `node --env-file=.env scripts/notify.mjs` with `GITHUB_EVENT_NAME` and `GITHUB_EVENT_PATH` set. This bypasses the webhook queue and is for manual diagnostics.
 
-Official references: [GitHub organization webhooks](https://docs.github.com/en/webhooks/types-of-webhooks#organization-webhooks), [signature verification](https://docs.github.com/en/webhooks/using-webhooks/validating-webhook-deliveries), [webhook redelivery](https://docs.github.com/en/webhooks/using-webhooks/handling-failed-webhook-deliveries), and [Discord webhook setup](https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks).
+## Architecture and migration
+
+`lib/receiver.mjs` owns HTTP authentication and filtering; `lib/notifications.mjs` retains the existing formatter; `lib/deliveries.mjs` owns persistent delivery and deduplication. `bot/` owns Discord connection, sending, commands, and registration. `lib/application.mjs` coordinates the worker and lifecycle; `server.mjs` validates configuration and handles process signals. See [design notes](docs/design.md).
+
+To upgrade an existing installation, keep its Compose project/directory and `deliveries` volume. Add the four `DISCORD_*` bot settings, remove `DISCORD_WEBHOOK_URL`, invite the bot, register commands, and rebuild. Existing queued alerts remain deliverable. Remove any old per-repository notification workflows to avoid duplicate alerts. The previous Discord incoming webhook can be deleted once bot delivery is verified.

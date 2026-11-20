@@ -3,6 +3,8 @@ services:
     build: .
     init: true
     restart: unless-stopped
+    # Drain active HTTP/Discord requests before closing SQLite.
+    stop_signal: SIGTERM
     stop_grace_period: 3m
     env_file: .env
     environment:

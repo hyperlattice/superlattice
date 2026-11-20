@@ -1,45 +1,94 @@
-# Run Hyperlattice alerts on a Raspberry Pi
+# Run Superlattice on a Raspberry Pi 5
 
-Use a 64-bit Raspberry Pi OS or Debian installation. These steps assume Docker Engine, the Compose plugin, Git, curl, and OpenSSL are installed. Follow [Docker's Debian installation guide](https://docs.docker.com/engine/install/debian/) for Docker Engine and Compose.
+Use Raspberry Pi OS 64-bit (Debian-based) or Debian ARM64. `uname -m` should report `aarch64`. The official Node.js 24 image supports ARM64 natively; Compose selects the host architecture. No x86 emulation or additional public bot port is needed.
 
-## Configure the service
+## Install prerequisites
 
-1. Clone this private repository using your existing GitHub SSH or HTTPS credentials:
+If Docker Engine and its Compose plugin are already installed, skip installation and enable the services below. For a fresh supported Debian-based Pi OS installation, follow [Docker's Debian installation guide](https://docs.docker.com/engine/install/debian/). These commands configure Docker's official apt repository:
 
-   ```sh
-   git clone https://github.com/hyperlattice/discordbot.git
-   cd discordbot
-   cp .env.example .env
-   chmod 600 .env
+```sh
+sudo apt-get update
+sudo apt-get install -y ca-certificates curl git openssl
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+sudo chmod a+r /etc/apt/keyrings/docker.asc
+. /etc/os-release
+sudo tee /etc/apt/sources.list.d/docker.sources > /dev/null <<EOF_DOCKER
+Types: deb
+URIs: https://download.docker.com/linux/debian
+Suites: ${VERSION_CODENAME}
+Components: stable
+Architectures: $(dpkg --print-architecture)
+Signed-By: /etc/apt/keyrings/docker.asc
+EOF_DOCKER
+sudo apt-get update
+sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo systemctl enable --now docker
+sudo docker compose version
+```
+
+Use `sudo docker` if your account does not have Docker access. Commands below use `sudo` consistently. The Pi must remain powered and have internet access for continuous operation.
+
+## Create and invite the Discord bot
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications), create an application called **Superlattice**, and copy its **Application ID** from General Information. This is `DISCORD_CLIENT_ID`.
+2. Open **Bot**; create the bot if prompted. Use **Reset Token** to obtain its token and store it as `DISCORD_BOT_TOKEN`. Never use a user token or an incoming webhook URL. Leave Presence, Server Members, and Message Content privileged intents disabled. Leave **Interactions Endpoint URL** empty; this application receives interactions over the Gateway.
+3. In **OAuth2 → URL Generator** (or guild installation settings), select `bot` and `applications.commands`. Select only **View Channels**, **Send Messages**, and **Embed Links**. Open the generated URL, select the server, and authorize with an account that can manage that server. Do not grant Administrator. The equivalent invitation URL is:
+
+   ```text
+   https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot%20applications.commands&permissions=19456
    ```
 
-2. In Discord, open **Server Settings → Integrations → Webhooks**. Create a webhook and select your destination text channel. Copy its URL.
+4. In Discord user settings, enable **Advanced → Developer Mode**. Right-click your server and choose **Copy Server ID** for `DISCORD_GUILD_ID`. Right-click the destination text channel and choose **Copy Channel ID** for `DISCORD_CHANNEL_ID`.
+5. Check channel permission overrides: the bot must be able to view the channel, send messages, and embed links. Use a normal server text channel for the simplest setup. Server members need permission to use application commands. Choose a channel whose members may read all monitored private repositories.
 
-3. Generate a shared secret:
+See [Discord's app setup documentation](https://docs.discord.com/developers/quick-start/getting-started) for the portal flow.
 
-   ```sh
-   openssl rand -hex 32
-   ```
+## Configure and start the application
 
-4. Edit `.env` on the Pi:
+Clone with your existing GitHub credentials, then create the private configuration:
 
-   ```dotenv
-   GITHUB_ORGANIZATION=hyperlattice
-   GITHUB_WEBHOOK_SECRET=the-random-secret-you-generated
-   DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/ID/TOKEN
-   ```
+```sh
+git clone https://github.com/hyperlattice/discordbot.git
+cd discordbot
+cp .env.example .env
+chmod 600 .env
+openssl rand -hex 32
+nano .env
+```
 
-   Replace both placeholders. Keep these values private. Use the normal Discord webhook URL without `/github`. Ensure the Discord channel's members may read content from all monitored private repositories.
+Fill in:
 
-5. Build and start the receiver:
+```dotenv
+DISCORD_BOT_TOKEN=YOUR_BOT_TOKEN
+DISCORD_CLIENT_ID=YOUR_APPLICATION_ID
+DISCORD_GUILD_ID=YOUR_SERVER_ID
+DISCORD_CHANNEL_ID=YOUR_TEXT_CHANNEL_ID
+GITHUB_ORGANIZATION=hyperlattice
+GITHUB_WEBHOOK_SECRET=YOUR_GENERATED_SECRET
+```
 
-   ```sh
-   sudo docker compose up -d --build
-   curl --fail http://127.0.0.1:3000/healthz
-   sudo docker compose ps
-   ```
+Keep the remaining defaults from `.env.example`. `DISCORD_GUILD_ID` is optional: use it for immediate server-scoped registration, or leave it blank for global server commands. The configured guild also restricts command usage and the notification channel to that server. Compose sets the internal port and data directory explicitly.
 
-   The health request returns `ok`. The container restarts after reboot when Docker is enabled. SQLite is stored in the named `deliveries` volume. Run only one receiver instance against that queue.
+Build, register commands once, and start the managed service:
+
+```sh
+sudo docker compose build
+sudo docker compose run --rm --no-deps discordbot npm run deploy-commands
+sudo docker compose up -d --build
+sudo docker compose logs -f
+```
+
+Press Ctrl-C to leave logs; the container stays running. Inspect separately:
+
+```sh
+sudo docker compose ps
+curl --fail http://127.0.0.1:3000/healthz
+```
+
+The bot should appear online and the health endpoint should return `ok` after Discord login and channel validation. Command registration uses Discord REST, does not start a second Gateway client, and does not run automatically on reconnect. Rerun it after command definitions change.
+
+`restart: unless-stopped` restarts crashes and resumes the service after Pi reboots when Docker is enabled. An explicitly stopped container remains stopped until started again. The existing `deliveries` named volume stores SQLite. Run one application instance per queue. Keep the same checkout directory/Compose project name when migrating so Compose uses the existing volume.
 
 ## Give GitHub a public HTTPS endpoint
 
@@ -77,9 +126,11 @@ Open [Hyperlattice organization webhook settings](https://github.com/organizatio
 
 Create the webhook in the organization settings, not an individual repository. It covers all repositories owned by Hyperlattice, including private repositories and repositories created later. The receiver uses repository-owner checks, so transferred-out repositories are rejected.
 
-Do not use the Discord webhook URL as GitHub's payload URL. GitHub calls your Pi, and the Pi formats and posts to Discord.
+GitHub calls the Pi at `/github/webhook`; the Pi formats queued notifications and sends them through the Discord bot account.
 
 ## Verify delivery
+
+First run `/ping`, `/status`, `/github`, and `/help` in the configured server. Confirm the bot appears online and `/status` shows the receiver as Listening.
 
 1. In GitHub's webhook page, open **Recent Deliveries**. The automatic `ping` should return HTTP 200 with `pong`.
 2. Open an issue in any Hyperlattice repository with a description and assignee. Confirm that Discord receives its title, description, and assignee.
@@ -94,10 +145,16 @@ Issue and PR deliveries return HTTP 202 after durable queue insertion. Unsupport
 
 ## Recover after failures
 
+- **Bot offline or container restarting:** Inspect `docker compose logs --tail=100`. Verify `DISCORD_BOT_TOKEN` is the bot token, `DISCORD_CLIENT_ID` is its application ID, and outbound HTTPS/WebSocket connections to Discord are available. No privileged intents should be enabled or requested. Recreate the container after changing `.env`.
+- **Channel startup failure:** Copy a server text channel ID, invite the bot to that server, and allow View Channel, Send Messages, and Embed Links in its channel overrides. Forum/category channels cannot directly receive these messages. Threads additionally require Send Messages in Threads, accessible membership, and an available thread.
+- **Slash commands missing:** Run the registration command again. Check that the application is invited with `applications.commands`, the guild ID is the server where you are testing, and users may Use Application Commands. Leave Interactions Endpoint URL blank. Global commands can take time to propagate.
+- **Duplicate slash commands after a scope change:** Clear the old scope using `npm run deploy-commands -- --clear` with its original guild setting, then register in the new scope. See the README.
+- **Funnel unreachable:** Inspect `sudo tailscale funnel status`, `sudo systemctl status tailscaled`, and the local `/healthz` endpoint. Enable Funnel/HTTPS according to tailnet policy.
+
 - **HTTP 401 from the Pi:** The GitHub webhook secret and Pi secret differ, or the forwarded body was modified.
 - **HTTP 403 from the Pi:** Check `GITHUB_ORGANIZATION` and the event repository's owner.
 - **No GitHub delivery:** Check that the webhook is active and is installed in the organization settings.
-- **Queued but absent from Discord:** Check the Discord URL and channel permissions. The service retries delivery failures with backoff.
+- **Queued but absent from Discord:** Check the bot token, channel ID, bot membership, and channel permissions. Run `/status` to inspect the connection. The service retries delivery failures with backoff.
 - **Pi or internet outage:** Restore service, then redeliver failed requests from GitHub's **Recent Deliveries** page. GitHub does not retry them automatically.
 - **`manual retry required` in logs:** Correct the Discord or network configuration and run:
 

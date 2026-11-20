@@ -2,10 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
-import { buildMessage, sendMessage } from '../scripts/notify.mjs';
+import { buildMessage } from '../scripts/notify.mjs';
 
 const fixture = JSON.parse(await readFile(new URL('./fixtures/pr.json', import.meta.url)));
-const webhook = 'https://discord.com/api/webhooks/123/fake-test-token';
 const pr = () => structuredClone(fixture);
 
 test('PR alert shows description, author, assignees, user and team reviewers', () => {
@@ -82,55 +81,10 @@ test('large Unicode payload fits Discord per-field and 6000-character embed limi
   assert.ok(text.isWellFormed());
 });
 
-test('sender posts formatted event JSON with receipt confirmation and mentions disabled', async () => {
-  const message = buildMessage('pull_request', pr());
-  await sendMessage(webhook, message, { fetchImpl: async (url, options) => {
-    assert.equal(url.searchParams.get('wait'), 'true');
-    assert.equal(options.method, 'POST');
-    assert.equal(options.redirect, 'error');
-    assert.deepEqual(JSON.parse(options.body), message);
-    return new Response('{}', { status: 200 });
-  } });
-});
-
-test('429 honors fractional retry_after, then retries server and network failures', async () => {
-  let calls = 0;
-  const delays = [];
-  await sendMessage(webhook, {}, {
-    fetchImpl: async () => {
-      calls++;
-      if (calls === 1) return new Response('{"retry_after":0.25}', { status: 429 });
-      if (calls === 2) return new Response('', { status: 503 });
-      if (calls === 3) throw new Error(webhook);
-      return new Response('{}');
-    },
-    sleepImpl: async delay => delays.push(delay),
-  });
-  assert.equal(calls, 4);
-  assert.deepEqual(delays, [250, 2000, 4000]);
-});
-
-test('permanent errors stop immediately and never expose webhook or response body', async () => {
-  let calls = 0;
-  await assert.rejects(sendMessage(webhook, {}, { fetchImpl: async () => {
-    calls++; return new Response(webhook, { status: 401 });
-  } }), error => error.message.includes('401') && !error.message.includes('fake-test-token'));
-  assert.equal(calls, 1);
-  await assert.rejects(sendMessage(webhook, {}, {
-    fetchImpl: async () => { throw new Error(webhook); }, sleepImpl: async () => {},
-  }), error => /four attempts/.test(error.message) && !error.message.includes('fake-test-token'));
-});
-
-test('invalid webhook hosts, redirects, and /github suffix are refused before sending', async () => {
-  for (const url of ['', 'https://example.com/api/webhooks/123/token', webhook + '/github', webhook.replace('https:', 'http:')]) {
-    await assert.rejects(sendMessage(url, {}, { fetchImpl: () => assert.fail('Must not send') }));
-  }
-});
-
 test('manual setup test and CLI preview work without a webhook secret', () => {
   assert.match(buildMessage('workflow_dispatch', {}).content, /connected/);
   const result = spawnSync(process.execPath, ['scripts/notify.mjs', '--dry-run'], {
-    encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: 'test/fixtures/pr.json', DISCORD_WEBHOOK_URL: '' },
+    encoding: 'utf8', env: { ...process.env, GITHUB_EVENT_NAME: 'pull_request', GITHUB_EVENT_PATH: 'test/fixtures/pr.json', DISCORD_BOT_TOKEN: '' },
   });
   assert.equal(result.status, 0, result.stderr);
   assert.equal(JSON.parse(result.stdout).embeds[0].url, fixture.pull_request.html_url);

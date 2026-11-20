@@ -1,13 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHmac } from 'node:crypto';
-import { createServer } from 'node:http';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DeliveryStore } from '../lib/deliveries.mjs';
 import { createReceiver } from '../lib/receiver.mjs';
-import { sendMessage } from '../scripts/notify.mjs';
+import { createMessageSender } from '../bot/delivery.mjs';
+import { PermissionFlagsBits } from 'discord.js';
 
 const secret = 'a'.repeat(64);
 const fixture = JSON.parse(await readFile(new URL('./fixtures/pr.json', import.meta.url)));
@@ -42,27 +42,22 @@ function post(url, { payload = fixture, event = 'pull_request', id = 'delivery-1
   });
 }
 
-test('signed organization PR reaches HTTP receiver, survives restart, and posts complete Discord JSON', async t => {
+test('signed PR is visible to a reopened database connection and delivers through the bot without duplicates', async t => {
   const { store, path, url } = await setup(t);
-  let outgoing;
-  const discord = createServer(async (req, res) => {
-    let raw = '';
-    for await (const chunk of req) raw += chunk;
-    outgoing = { path: req.url, payload: JSON.parse(raw) };
-    res.writeHead(200, { 'content-type': 'application/json' }); res.end('{"id":"123"}');
-  });
-  const discordUrl = await listen(discord);
-  t.after(() => new Promise(resolve => discord.close(resolve)));
   assert.equal((await post(url)).status, 202);
   const restarted = new DeliveryStore(path);
+  let outgoing;
+  const channel = {
+    guildId: 'guild', isSendable: () => true, isThread: () => false,
+    permissionsFor: () => ({ has: bits => bits.includes(PermissionFlagsBits.EmbedLinks) }),
+    send: async payload => { outgoing = payload; return { id: '123' }; },
+  };
+  const client = { isReady: () => true, channels: { fetch: async () => channel }, user: {} };
   try {
-    assert.equal(await restarted.deliverOne(message => sendMessage('https://discord.com/api/webhooks/123/test-token', message, {
-      fetchImpl: (target, options) => fetch(discordUrl + target.pathname + target.search, options),
-    })), true);
-    assert.match(outgoing.path, /wait=true/);
-    assert.equal(outgoing.payload.embeds[0].description, fixture.pull_request.body);
-    assert.equal(outgoing.payload.embeds[0].fields.find(f => f.name === 'Requested reviewers').value, '@reviewer, @hyperlattice/backend');
-    assert.deepEqual(outgoing.payload.allowed_mentions, { parse: [] });
+    assert.equal(await restarted.deliverOne(createMessageSender(client, { channelId: 'channel' })), true);
+    assert.equal(outgoing.embeds[0].description, fixture.pull_request.body);
+    assert.equal(outgoing.embeds[0].fields.find(f => f.name === 'Requested reviewers').value, '@reviewer, @hyperlattice/backend');
+    assert.deepEqual(outgoing.allowedMentions, { parse: [], repliedUser: false });
     const duplicate = await post(url);
     assert.equal(await duplicate.text(), 'Already received');
     assert.equal(await store.deliverOne(() => assert.fail('Duplicate must not send')), false);

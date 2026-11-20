@@ -1,47 +1,51 @@
 import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
-import { setTimeout as sleep } from 'node:timers/promises';
 import { DeliveryStore } from './lib/deliveries.mjs';
-import { createReceiver } from './lib/receiver.mjs';
-import { sendMessage } from './scripts/notify.mjs';
+import { readConfig } from './lib/config.mjs';
+import { createApplication } from './lib/application.mjs';
+import { createBot } from './bot/client.mjs';
 
-const directory = process.env.DATA_DIR || './data';
-mkdirSync(directory, { recursive: true });
-const store = new DeliveryStore(join(directory, 'deliveries.sqlite'));
-if (process.argv.includes('--retry-failed')) {
-  console.log(`Requeued ${store.retryFailed()} failed deliveries.`);
-  store.close();
-} else {
-  if (!process.env.DISCORD_WEBHOOK_URL) throw new Error('Set DISCORD_WEBHOOK_URL.');
-  const server = createReceiver({
-    secret: process.env.GITHUB_WEBHOOK_SECRET,
-    organization: process.env.GITHUB_ORGANIZATION || 'hyperlattice', store,
-  });
-  let running = true;
-  let serving = false;
-  const worker = async () => {
-    while (running) {
-      try {
-        if (!await store.deliverOne(message => sendMessage(process.env.DISCORD_WEBHOOK_URL, message))) {
-          store.prune();
-          await sleep(1000);
-        }
-      } catch {
-        console.error('Delivery queue unavailable. Check persistent storage.');
-        await sleep(5000);
-      }
-    }
+async function main() {
+  if (process.argv.includes('--retry-failed')) {
+    const directory = process.env.DATA_DIR || './data';
+    mkdirSync(directory, { recursive: true });
+    const store = new DeliveryStore(join(directory, 'deliveries.sqlite'));
+    try { console.log(`Requeued ${store.retryFailed()} failed deliveries.`); } finally { store.close(); }
+    return;
+  }
+  const config = readConfig();
+  mkdirSync(config.directory, { recursive: true });
+  const store = new DeliveryStore(join(config.directory, 'deliveries.sqlite'));
+  let app;
+  const client = createBot({ config, startedAt: Date.now(), receiverStatus: () => app.receiverStatus() });
+  app = createApplication({ config, client, store });
+  let stopping = false;
+  const stop = () => {
+    if (stopping) return;
+    stopping = true;
+    // Leave pending work durable if an external request never settles.
+    const deadline = setTimeout(() => {
+      console.error('Shutdown deadline exceeded; pending deliveries will resume on restart.');
+      process.exit(1);
+    }, 150_000);
+    deadline.unref();
+    app.stop().catch(() => {
+      console.error('Unable to shut down cleanly.'); process.exitCode = 1;
+    }).finally(() => clearTimeout(deadline));
   };
-  let workerPromise;
-  server.listen(Number(process.env.PORT || 3000), '0.0.0.0', () => {
-    serving = true;
-    console.log('GitHub webhook receiver listening.');
-    workerPromise = worker();
-  });
-  for (const signal of ['SIGINT', 'SIGTERM']) process.once(signal, async () => {
-    running = false;
-    if (serving) await new Promise(resolve => server.close(resolve));
-    await workerPromise;
-    store.close();
-  });
+  process.once('SIGINT', stop);
+  process.once('SIGTERM', stop);
+  try { await app.start(); } catch {
+    if (!stopping) {
+      process.exitCode = 1;
+      console.error('Startup failed. Check bot credentials, application/channel IDs, permissions, network and storage.');
+    }
+    await app.stop();
+  }
 }
+
+main().catch(error => {
+  // Configuration errors contain variable names only, never their values.
+  console.error(error.message?.match(/^(DISCORD_|GITHUB_|PORT )/) ? error.message : 'Application failed to start. Check configuration and storage.');
+  process.exitCode = 1;
+});
